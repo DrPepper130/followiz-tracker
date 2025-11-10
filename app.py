@@ -1,41 +1,70 @@
-from flask import Flask, request, jsonify
-import requests
-import sqlite3
 import os
+import sqlite3
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-FOLLOWIZ_API_KEY = os.environ.get("FOLLOWIZ_API_KEY")  # we’ll set on Render
+# set this in Render → Environment → FOLLOWIZ_API_KEY
+FOLLOWIZ_API_KEY = os.environ.get("FOLLOWIZ_API_KEY")
 FOLLOWIZ_API_URL = "https://followiz.com/api/v2"
-
 DB_PATH = "orders.db"
+
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-# create table if not exists (simple)
+
 def init_db():
     conn = get_db()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sellapp_order_id TEXT,
-            followiz_order_id TEXT
+            sellapp_order_id TEXT NOT NULL,
+            followiz_order_id TEXT NOT NULL
         );
     """)
     conn.commit()
     conn.close()
 
+
 init_db()
 
+
+@app.route("/")
+def home():
+    return "followiz tracker is live ✅"
+
+
+# 1) your script calls this to save the mapping
+@app.route("/api/add-order", methods=["POST"])
+def add_order():
+    data = request.get_json(silent=True) or {}
+    sellapp_id = data.get("sellapp_order_id")
+    followiz_id = data.get("followiz_order_id")
+
+    if not sellapp_id or not followiz_id:
+        return jsonify({"error": "sellapp_order_id and followiz_order_id required"}), 400
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO orders (sellapp_order_id, followiz_order_id) VALUES (?, ?)",
+        (sellapp_id, followiz_id)
+    )
+    conn.commit()
+    return jsonify({"ok": True})
+
+
+# 2) your website / customer calls this
 @app.route("/api/order-status", methods=["GET"])
 def order_status():
     sellapp_id = request.args.get("order")
     if not sellapp_id:
-        return jsonify({"error": "order parameter required"}), 400
+        return jsonify({"error": "order query param required"}), 400
 
+    # find followiz id
     conn = get_db()
     cur = conn.execute(
         "SELECT followiz_order_id FROM orders WHERE sellapp_order_id = ?",
@@ -47,25 +76,31 @@ def order_status():
 
     followiz_id = row["followiz_order_id"]
 
-    # call followiz
+    if not FOLLOWIZ_API_KEY:
+        return jsonify({"error": "FOLLOWIZ_API_KEY not set on server"}), 500
+
+    # ask followiz for status (multiple-orders endpoint, but we send 1)
     r = requests.post(FOLLOWIZ_API_URL, data={
         "key": FOLLOWIZ_API_KEY,
         "action": "status",
         "orders": str(followiz_id)
     })
     fw = r.json()
-    data_for_this = fw.get(str(followiz_id))
-    if not data_for_this:
-        return jsonify({"error": "Provider didn’t return this order"}), 502
+    provider_data = fw.get(str(followiz_id))
+
+    if not provider_data:
+        return jsonify({"error": "Provider did not return this order"}), 502
 
     return jsonify({
         "sellapp_order_id": sellapp_id,
         "followiz_order_id": followiz_id,
-        "status": data_for_this.get("status"),
-        "remains": data_for_this.get("remains"),
-        "start_count": data_for_this.get("start_count"),
+        "status": provider_data.get("status"),
+        "remains": provider_data.get("remains"),
+        "start_count": provider_data.get("start_count"),
+        "charge": provider_data.get("charge"),
     })
 
-# Render uses this
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    # local run
+    app.run(host="0.0.0.0", port=5000)
