@@ -4,21 +4,17 @@ import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-app.config["PROPAGATE_EXCEPTIONS"] = True
 app.config["DEBUG"] = True
+app.config["PROPAGATE_EXCEPTIONS"] = True
 
-# --------------------------------------------------------------------
-# CONFIG
-# --------------------------------------------------------------------
 FOLLOWIZ_API_KEY = os.environ.get("FOLLOWIZ_API_KEY")
 FOLLOWIZ_API_URL = "https://followiz.com/api/v2"
-FOLLOWIZ_SERVICE_ID = os.environ.get("FOLLOWIZ_SERVICE_ID")  # optional, for auto-create
 DB_PATH = "orders.db"
 
 
-# --------------------------------------------------------------------
+# -------------------------------------------------
 # CORS
-# --------------------------------------------------------------------
+# -------------------------------------------------
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -27,9 +23,9 @@ def add_cors_headers(response):
     return response
 
 
-# --------------------------------------------------------------------
-# DB helpers
-# --------------------------------------------------------------------
+# -------------------------------------------------
+# DB
+# -------------------------------------------------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -54,15 +50,17 @@ def init_db():
 init_db()
 
 
-# --------------------------------------------------------------------
-# ROUTES
-# --------------------------------------------------------------------
+# -------------------------------------------------
+# ROOT
+# -------------------------------------------------
 @app.route("/")
 def home():
     return "followiz tracker is live ✅"
 
 
-# manual add (you already used this)
+# -------------------------------------------------
+# manual add (you used this from PowerShell)
+# -------------------------------------------------
 @app.route("/api/add-order", methods=["POST", "OPTIONS"])
 def add_order():
     if request.method == "OPTIONS":
@@ -86,22 +84,34 @@ def add_order():
     return jsonify({"ok": True})
 
 
-# customer lookup (Framer calls this)
+# -------------------------------------------------
+# lookup (Framer uses this)
+# -------------------------------------------------
 @app.route("/api/order-status", methods=["GET", "OPTIONS"])
 def order_status():
     if request.method == "OPTIONS":
         return "", 204
 
-    sellapp_id = request.args.get("order")
-    if not sellapp_id:
+    order_id = request.args.get("order")
+    if not order_id:
         return jsonify({"error": "order query param required"}), 400
 
     conn = get_db()
+    # try as Sell.app ID first
     cur = conn.execute(
         "SELECT followiz_order_id FROM orders WHERE sellapp_order_id = ?",
-        (str(sellapp_id),),
+        (str(order_id),),
     )
     row = cur.fetchone()
+
+    # if not found, try as Followiz ID (user pasted provider ID)
+    if not row:
+        cur = conn.execute(
+            "SELECT followiz_order_id FROM orders WHERE followiz_order_id = ?",
+            (str(order_id),),
+        )
+        row = cur.fetchone()
+
     conn.close()
 
     if not row:
@@ -112,41 +122,33 @@ def order_status():
     if not FOLLOWIZ_API_KEY:
         return jsonify({"error": "FOLLOWIZ_API_KEY not set"}), 500
 
+    # call followiz: single order status (your screenshot)
     try:
         r = requests.post(
             FOLLOWIZ_API_URL,
             data={
                 "key": FOLLOWIZ_API_KEY,
                 "action": "status",
-                "orders": str(followiz_id),
+                "order": str(followiz_id),  # single-order endpoint
             },
             timeout=10,
         )
-    except requests.RequestException as e:
-        return jsonify({"error": "Failed to contact provider", "details": str(e)}), 502
-
-    try:
         fw = r.json()
-    except ValueError:
-        return jsonify({"error": "Provider returned non-JSON"}), 502
-
-    provider_data = fw.get(str(followiz_id))
-    if not provider_data:
-        # Followiz didn’t know that order id
-        return jsonify({"status": None, "start_count": None, "remains": None})
+    except Exception as e:
+        return jsonify({"error": "Failed to contact provider", "details": str(e)}), 502
 
     return jsonify(
         {
-            "status": provider_data.get("status"),
-            "start_count": provider_data.get("start_count"),
-            "remains": provider_data.get("remains"),
+            "status": fw.get("status"),
+            "start_count": fw.get("start_count"),
+            "remains": fw.get("remains"),
         }
     )
 
 
-# --------------------------------------------------------------------
-# NEW: Sell.app webhook → auto-create on Followiz → save mapping
-# --------------------------------------------------------------------
+# -------------------------------------------------
+# Sell.app webhook (no service id, no provider create)
+# -------------------------------------------------
 @app.route("/api/sellapp-webhook", methods=["POST", "OPTIONS"])
 def sellapp_webhook():
     if request.method == "OPTIONS":
@@ -158,83 +160,44 @@ def sellapp_webhook():
 
     # we only care about order.paid
     if event != "order.paid":
-        return jsonify({"ok": False, "reason": "unsupported event"}), 400
+        return jsonify({"ok": True, "ignored": True})
 
     sellapp_order_id = str(data.get("id"))
-    if not sellapp_order_id:
-        return jsonify({"ok": False, "reason": "no sellapp id"}), 400
+    # try to see if caller already sent us followiz_order_id
+    # (you can add it from your script when you POST to this endpoint)
+    followiz_order_id = payload.get("followiz_order_id")
 
-    if not FOLLOWIZ_API_KEY:
-        return jsonify({"ok": False, "reason": "FOLLOWIZ_API_KEY not set"}), 500
-
-    if not FOLLOWIZ_SERVICE_ID:
-        # you didn’t set a service id, so we can’t auto-create.
-        # but we can at least tell you the sellapp id that came in.
-        return jsonify({
-            "ok": False,
-            "reason": "FOLLOWIZ_SERVICE_ID not set on server",
-            "sellapp_order_id": sellapp_order_id
-        }), 500
-
-    # try to get the link / username from additional_information
-    link = None
-    quantity = 1
-
-    product_variants = data.get("product_variants") or []
-    if product_variants:
-        pv = product_variants[0]
-        quantity = pv.get("quantity", 1)
-        add_info = pv.get("additional_information") or []
-        for field in add_info:
-            # very rough: pick the first value
-            if field.get("value"):
-                link = field["value"]
-                break
-
-    if not link:
-        # fallback so followiz doesn't crash
-        link = "https://instagram.com"
-
-    # create the Followiz order
-    try:
-        fw_res = requests.post(
-            FOLLOWIZ_API_URL,
-            data={
-                "key": FOLLOWIZ_API_KEY,
-                "action": "add",
-                "service": FOLLOWIZ_SERVICE_ID,
-                "link": link,
-                "quantity": quantity,
-            },
-            timeout=10,
+    if sellapp_order_id and followiz_order_id:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO orders (sellapp_order_id, followiz_order_id) VALUES (?, ?)",
+            (sellapp_order_id, str(followiz_order_id)),
         )
-        fw_json = fw_res.json()
-    except Exception as e:
-        return jsonify({"ok": False, "reason": "error calling followiz", "details": str(e)}), 502
+        conn.commit()
+        conn.close()
+        return jsonify(
+            {
+                "ok": True,
+                "saved": True,
+                "sellapp_order_id": sellapp_order_id,
+                "followiz_order_id": followiz_order_id,
+            }
+        )
 
-    followiz_order_id = fw_json.get("order")
-    if not followiz_order_id:
-        return jsonify({"ok": False, "reason": "followiz did not return order", "provider": fw_json}), 502
-
-    # save mapping
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO orders (sellapp_order_id, followiz_order_id) VALUES (?, ?)",
-        (sellapp_order_id, str(followiz_order_id)),
+    # if we got here, we got the Sell.app order but not the Followiz order.
+    # that's fine — respond 200 so Sell.app doesn't retry.
+    return jsonify(
+        {
+            "ok": True,
+            "saved": False,
+            "sellapp_order_id": sellapp_order_id,
+            "reason": "no followiz_order_id provided; call /api/add-order or send it in webhook next time",
+        }
     )
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        "ok": True,
-        "sellapp_order_id": sellapp_order_id,
-        "followiz_order_id": followiz_order_id
-    })
 
 
-# --------------------------------------------------------------------
-# LOCAL RUN
-# --------------------------------------------------------------------
+# -------------------------------------------------
+# local run
+# -------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
